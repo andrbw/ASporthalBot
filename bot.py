@@ -44,8 +44,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/search - Start searching for available slots\n"
         "Example queries:\n"
         "- find all free slots 2 hours long this weekend in time range 10:00-15:00\n"
-        "- show available slots 1 hour long this weekend between 14:00-18:00\n\n"
-        "/test - Test the scraper with a predefined command\n"
+        "- show available 1.5h slots this Sunday morning\n\n"
         "/cancel - Cancel the current operation\n"
         "/help - Show this help message"
     )
@@ -62,27 +61,43 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         scraper = AntwerpenSportScraper()
         
         # Convert command to query format
-        query = [{
-            'date': command['date'],
-            'start_time': command['start_time'],
-            'end_time': command['end_time'],
-            'duration_hours': command['duration_hours']
-        }]
+        query_slots = []
+        for slot in command['slots']:
+            query_slots.append({
+                'date': slot['date'],
+                'start_time': slot['start_time'],
+                'end_time': slot['end_time'],
+                'duration_hours': slot['duration_hours']
+            })
+
+        # Notify the user that the bot is searching for slots
+        await update.message.reply_text("⏳ Searching for available slots... Please wait.")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
         # Search for slots
-        slots = scraper.search_slots(query)
+        slots = scraper.search_slots(query_slots)
         
-        # Find available duration slots
-        duration_slots = scraper.find_available_duration_slots(slots, command['duration_hours'])
+        # Find available duration slots for each query
+        all_duration_slots = []
+        for query in query_slots:
+            # Filter slots for this query
+            query_slots = [slot for slot in slots if 
+                         slot['date'] == query['date'] and
+                         slot['start_time'] == query['start_time'] and
+                         slot['end_time'] == query['end_time']]
+            
+            # Find available duration slots
+            duration_slots = scraper.find_available_duration_slots(query_slots, query['duration_hours'])
+            all_duration_slots.extend(duration_slots)
         
         # Format the response
-        if not duration_slots:
+        if not all_duration_slots:
             await update.message.reply_text("No available slots found for the specified time and duration.")
             return
         
-        response = f"*Available {command['duration_hours']}-hour slots for {command['date']} {command['start_time']}-{command['end_time']}:*\n\n"
+        response = f"*Available slots:*\n\n"
         
-        for slot in duration_slots:
+        for slot in all_duration_slots:
             slot_message = (
                 f"🏟️ *{slot['location_name']}*\n"
                 f"⏰ {slot['start_time']} - {slot['end_time']}\n"
@@ -115,6 +130,10 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     """Handle the natural language query and search for slots."""
     query = update.message.text
     
+    # Notify the user that the bot is searching for slots
+    await update.message.reply_text("⏳ Searching for available slots... Please wait.")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
     try:
         # Initialize the scraper
         scraper = AntwerpenSportScraper()
@@ -129,7 +148,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             'end_time': slot.end_time,
             'duration_hours': slot.duration_hours
         } for slot in slot_queries]
-        
+
         # Search for slots
         slots = scraper.search_slots(query_slots)
         

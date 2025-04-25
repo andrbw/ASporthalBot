@@ -12,6 +12,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import time
+import concurrent.futures
+from functools import partial
 
 # Example slots for testing
 EXAMPLE_SLOTS = [
@@ -37,14 +39,14 @@ class AntwerpenSportScraper:
         self.logger = logging.getLogger(__name__)
         
         # Set up Chrome options
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")  # Run in headless mode
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--window-size=1920,1080")  # Set window size
+        self.chrome_options = Options()
+        self.chrome_options.add_argument("--headless")  # Run in headless mode
+        self.chrome_options.add_argument("--no-sandbox")
+        self.chrome_options.add_argument("--disable-dev-shm-usage")
+        self.chrome_options.add_argument("--window-size=1920,1080")  # Set window size
         
         # Initialize the WebDriver
-        self.driver = webdriver.Chrome(options=chrome_options)
+        self.driver = webdriver.Chrome(options=self.chrome_options)
         self.wait = WebDriverWait(self.driver, 10)  # Wait up to 10 seconds
 
     def search_slots(self, query_slots: List[Dict]) -> List[Dict]:
@@ -104,9 +106,6 @@ class AntwerpenSportScraper:
                     )
                     self.logger.info("Locations loaded")
                     
-                    # Give a little extra time for all locations to load
-                    time.sleep(2)
-                    
                     # Get the page source after JavaScript execution
                     page_source = self.driver.page_source
                     
@@ -114,49 +113,67 @@ class AntwerpenSportScraper:
                     locations = self._parse_locations(page_source)
                     self.logger.info(f"Found {len(locations)} locations")
                     
-                    # Check each location for available slots
-                    for location in locations:
-                        location_id = location['id']
-                        location_name = location['name']
-                        self.logger.info(f"Checking slots for location: {location_name} (ID: {location_id})")
-                        
-                        # Navigate to the location page
-                        location_params = {
-                            'sport': '2317',
-                            'from': str(start_timestamp),
-                            'to': str(end_timestamp),
-                            'date': formatted_date,
-                            'location': str(location_id)
+                    # Create a new driver for each thread
+                    def process_location(location, query_data):
+                        try:
+                            driver = webdriver.Chrome(options=self.chrome_options)
+                            wait = WebDriverWait(driver, 10)
+                            
+                            location_id = location['id']
+                            location_name = location['name']
+                            self.logger.info(f"Checking slots for location: {location_name} (ID: {location_id})")
+                            
+                            # Navigate to the location page
+                            location_params = {
+                                'sport': '2317',
+                                'from': str(start_timestamp),
+                                'to': str(end_timestamp),
+                                'date': formatted_date,
+                                'location': str(location_id)
+                            }
+                            
+                            driver.get(
+                                f"{self.location_url}/{location_id}?{'&'.join(f'{k}={v}' for k, v in location_params.items())}"
+                            )
+                            
+                            # Wait for the slots table to load
+                            try:
+                                wait.until(
+                                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.reservations-timeslots-wrapper"))
+                                )
+                                self.logger.info("Slots table loaded")
+                                
+                                # Parse the slots, passing the time range for filtering
+                                location_slots = self._parse_available_slots(driver.page_source, start_time, end_time)
+                                for slot in location_slots:
+                                    slot['location_name'] = location_name
+                                    slot['location_id'] = location_id
+                                    slot['date'] = query_data['date']
+                                    slot['start_time'] = query_data['start_time']
+                                    slot['end_time'] = query_data['end_time']
+                                
+                                return location_slots
+                                
+                            except TimeoutException:
+                                self.logger.error(f"Timeout waiting for slots table for location {location_name}")
+                                return []
+                            finally:
+                                driver.quit()
+                                
+                        except Exception as e:
+                            self.logger.error(f"Error processing location {location['name']}: {str(e)}")
+                            return []
+                    
+                    # Process locations in parallel
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        future_to_location = {
+                            executor.submit(process_location, location, query): location 
+                            for location in locations
                         }
                         
-                        self.driver.get(
-                            f"{self.location_url}/{location_id}?{'&'.join(f'{k}={v}' for k, v in location_params.items())}"
-                        )
-                        
-                        # Wait for the slots table to load
-                        try:
-                            self.wait.until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, "div.reservations-timeslots-wrapper"))
-                            )
-                            self.logger.info("Slots table loaded")
-                            
-                            # Give a little extra time for all slots to load
-                            time.sleep(2)
-                            
-                            # Parse the slots, passing the time range for filtering
-                            location_slots = self._parse_available_slots(self.driver.page_source, start_time, end_time)
-                            for slot in location_slots:
-                                slot['location_name'] = location_name
-                                slot['location_id'] = location_id
-                                slot['date'] = query['date']
-                                slot['start_time'] = start_time
-                                slot['end_time'] = end_time
-                            
+                        for future in concurrent.futures.as_completed(future_to_location):
+                            location_slots = future.result()
                             all_results.extend(location_slots)
-                            
-                        except TimeoutException:
-                            self.logger.error(f"Timeout waiting for slots table for location {location_name}")
-                            continue
                     
                 except TimeoutException:
                     self.logger.error("Timeout waiting for locations to load")
@@ -165,7 +182,7 @@ class AntwerpenSportScraper:
             except Exception as e:
                 self.logger.error(f"Error while searching for slots: {str(e)}")
                 continue
-        
+
         return all_results
 
     def _parse_locations(self, html_content: str) -> List[Dict]:
